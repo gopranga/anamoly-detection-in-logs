@@ -1,0 +1,42 @@
+# Configuration for the Log Parsing + Drain3 Pipeline
+drain:
+  similarity_threshold: 0.5     # 0..1
+  depth: 5                      # tree depth
+  snapshot_interval_minutes: 60  # periodic snapshot
+  compress_state: true
+  snapshot_compress_state:  false  # reduce CPU cost of the remaining saves  :contentReference[oaicite:1]{index=1}
+
+paths:
+  input_path: "./data"  # directory or single file
+  log_file_pattern: "**/*.log"
+  output_dir: "./results"
+  # Files matching these patterns will be excluded from parsing
+  exclude_file_list:
+    - "**/js_console.log"
+    - "**/*.bxlog"
+  drain_state_file: "drain_state.bin"
+  templates_jsonl: "templates.jsonl"
+  corrected_templates_jsonl: "templates_corrected.jsonl"
+  embeddings_jsonl: "regex_embeddings.jsonl"
+
+parser:
+  # Multiline configuration
+  multiline:
+    enabled: true
+    # Lines that match ANY of these regexes are considered the START of a new log entry.
+    # The first pattern covers your sample: [YYYY-mm-dd HH:MM:SS.mmm]
+    start_regexes:
+      - '^\[\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d{3})?\]'
+      # (optional) bare timestamp without brackets:
+      - '^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}'
+    join_with: " "     # how to join continuation lines
+    max_lines: 2000     # safety guard to prevent pathological growth
+
+  timestamp_level_patterns:
+    # 1.) [2025-08-27 11:07:22.966] [debug  ] [ipwl] [ 6052: 2192] [B934A2: 557] whitelist is the same, distribution skipped
+    - '^\[(?P<timestamp>.*?)\]\s*\[(?P<level>\w+)\s*\]\s*\[(?P<component>[-:.\w]+)\s*\]\s*\[\s*(?P<pid>\d+):\s*(?P<tid>\d+)\s*\]\s*\[(?P<file_guid_prefix>[A-Za-z0-9]+):\s*(?P<line_no>\d+)\s*\]\s*(?P<message>.*)$'
+    # 2.) [2025-08-27 11:07:06.247] 5088 UnregisterJob_2 END long=0
+    - '^\[(?P<timestamp>.*?)\]\s*(?P<pid>\d+)\s*(?P<message>.*)$'
+  default_timezone: "UTC"
+  level_map:
+    fnction: "FUNCTION"
