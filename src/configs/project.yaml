@@ -1,24 +1,39 @@
-# Configuration for the Log Parsing + Drain3 Pipeline
-drain:
-  similarity_threshold: 0.5     # 0..1
-  depth: 5                      # tree depth
-  snapshot_interval_minutes: 60  # periodic snapshot
-  compress_state: true
-  snapshot_compress_state:  false  # reduce CPU cost of the remaining saves  :contentReference[oaicite:1]{index=1}
+# src/configs/project.yaml
 
+# Central configuration for the entire log anomaly detection pipeline.
 paths:
-  input_path: "./data"  # directory or single file
-  log_file_pattern: "**/*.log"
-  output_dir: "./results"
-  # Files matching these patterns will be excluded from parsing
+  # Path for training can be a single file or a directory to scan.
+  training_logs_path: "C:\\Avast-WS\\AQual-AI-Hub\\project_ws\\aqual_ai_hub\\data\\training_logs\\nortonsvc_log_samples\\"
+  log_file_pattern: "NortonSvc*.log"
   exclude_file_list:
     - "**/js_console.log"
     - "**/*.bxlog"
-  drain_state_file: "drain_state.bin"
-  templates_jsonl: "templates.jsonl"
-  corrected_templates_jsonl: "templates_corrected.jsonl"
-  embeddings_jsonl: "regex_embeddings.jsonl"
+    - "**/AvEmUpdate.log"
 
+  # Directory where all results and model artifacts will be saved.
+  output_dir: "C:\\Avast-WS\\AQual-AI-Hub\\project_ws\\aqual_ai_hub\\outputs\\norton_svc"
+
+  # --- File names for saved artifacts ---
+  parsed_logs_file: "parsed_logs.csv"
+  drain_state_file: "drain3_state.bin"
+  corrected_templates_file: "log_templates.jsonl"
+  output_embeddings_file: "log_embeddings.npy"
+  k_evaluations_file: "k_evaluations.json"
+  model_summary_file: "model_summary.json"
+  cluster_centers_file: "cluster_centers.npy"
+  labels_file: "labels.npy"
+
+  # --- Visualization artifacts ---
+  pca_plot_file: "pca_cluster_visualization.png"
+  tsne_plot_file: "tsne_cluster_visualization.png"
+
+  # A sample log file to use for the 'detect' command.
+  detection_log_file: "C:\\Avast-WS\\AQual-AI-Hub\\project_ws\\aqual_ai_hub\\data\\new_logs\\norton_svc_samples\\1757558592519-c14a7d550d09459e8051a50794710afe\\log\\NortonSvc.log"
+  detection_new_log_messages_file: "detection_new_log_messages.csv"
+  detection_logs_template_file: "detection_logs_templates.jsonl"
+  anomaly_output_file: "anomaly_report.csv"
+
+# Configuration for the RawLogParser class.
 parser:
   # Multiline configuration
   multiline:
@@ -37,6 +52,61 @@ parser:
     - '^\[(?P<timestamp>.*?)\]\s*\[(?P<level>\w+)\s*\]\s*\[(?P<component>[-:.\w]+)\s*\]\s*\[\s*(?P<pid>\d+):\s*(?P<tid>\d+)\s*\]\s*\[(?P<file_guid_prefix>[A-Za-z0-9]+):\s*(?P<line_no>\d+)\s*\]\s*(?P<message>.*)$'
     # 2.) [2025-08-27 11:07:06.247] 5088 UnregisterJob_2 END long=0
     - '^\[(?P<timestamp>.*?)\]\s*(?P<pid>\d+)\s*(?P<message>.*)$'
-  default_timezone: "UTC"
   level_map:
     fnction: "FUNCTION"
+
+# Configuration for the embedding model.
+embedding_config:
+  # Model from HuggingFace Sentence Transformers library.
+  model_name: 'all-MiniLM-L6-v2'
+
+# Configuration for the Drain3 template miner.
+drain_config:
+  similarity_threshold: 0.65
+  depth: 5
+  snapshot_interval_minutes: 15
+  compress_state: true
+  # Interval in seconds for the throttled_snapshots context manager.
+  throttled_snapshot_interval_sec: 300
+
+# Configuration for the template correction heuristics.
+template_correction:
+  # List of user-defined strings to be treated as variables.
+  user_strings:
+    - "admin"
+    - "root"
+    - "null"
+    - "C++"
+
+# Options that control which columns are used in the pipeline.
+pipeline_options:
+  message_column: "message"
+
+# Configuration for the KMeans clustering stage
+clustering:
+  # Method can be 'minibatch' (recommended for large datasets) or 'kmeans'.
+  method: 'kmeans'
+
+  # --- K Value Configuration ---
+  # Set a specific integer (e.g., 15) to force the number of clusters.
+  # Set to 'auto' to use the automatic k-selection process (Elbow/Silhouette).
+  k_value: "auto"
+
+  # Parameters for MiniBatchKMeans
+  batch_size: 2048
+  max_iter: 100
+
+  # For sklearn >= 1.4, use 'auto'. For older versions, use a number like 10.
+  n_init: 'auto'
+  random_state: 42
+
+  distance_threshold: 99
+
+  # Configuration for the k-selection process
+  k_selection:
+    # Range of k values to test.
+    start: 2
+    stop: 50
+    step: 2
+    # Number of data points to sample for expensive metrics like silhouette score.
+    sample_size: 10000

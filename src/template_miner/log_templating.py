@@ -1,233 +1,286 @@
+# src/template_miner/log_templating.py
+"""
+Handles log template mining using the Drain3 algorithm. This module defines the
+pipeline for training the template miner from parsed logs and exporting the
+resulting templates. It preserves the original logic of using a file-based
+persistence handler and a throttled snapshot mechanism.
+"""
+
 import logging
 import os
 import time
 from contextlib import contextmanager
-from typing import Dict, List
+from typing import Any, Dict, Generator, List, Optional
 
 import pandas as pd
+import yaml
 from tqdm import tqdm
 
-# Drain3 imports (install drain3)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
+
+# Drain3 imports are handled with a try-except block for graceful failure.
 try:
     from drain3 import TemplateMiner
     from drain3.file_persistence import FilePersistence
-    from drain3.memory_buffer_persistence import MemoryBufferPersistence
     from drain3.template_miner_config import TemplateMinerConfig
-except Exception as e:
+except ImportError:
+    # Allows the module to be imported even if drain3 is not installed.
     TemplateMiner = None  # type: ignore
 
-from src.log_parser.parser import load_config, parse_logs_to_df
 from src.template_miner.template_correction import correct_oracle_template
-
-LOGGER = logging.getLogger(__name__)
 
 
 class Drain3Pipeline:
-    def __init__(self, config: Dict) -> None:
-        self.config = config
-        self.paths = config['paths']
-        self.drain_cfg = config.get('drain', {})
-        self._tm = None
+    """A pipeline for training a Drain3 model and exporting log templates."""
 
-    def _make_template_miner(self):
+    def __init__(self, config: Dict[str, Any]) -> None:
+        """
+        Initializes the Drain3Pipeline.
+
+        Args:
+            config: The project configuration dictionary.
+        """
         if TemplateMiner is None:
             raise RuntimeError("drain3 is not installed in this environment.")
-        # Create/override config
+
+        self.config = config
+        self.paths = config["paths"]
+        self.drain_cfg = config.get("drain_config", {})
+        self.correction_cfg = config.get("template_correction", {})
+        self._tm: TemplateMiner = self._make_template_miner()
+
+    def _make_template_miner(self) -> TemplateMiner:
+        """
+        Creates and configures a TemplateMiner instance from the project config.
+
+        Returns:
+            A configured TemplateMiner instance.
+        """
         cfg = TemplateMinerConfig()
 
-        # TODO: In PROD setup, we need to load drain3.ini and override values.
-        sim = self.drain_cfg.get('similarity_threshold')
-        if sim is not None:
-            try:
-                cfg.drain_sim_th = float(sim)
-            except Exception:
-                pass
-        depth = self.drain_cfg.get('depth')
-        if depth is not None:
-            try:
-                cfg.drain_depth = int(depth)
-            except Exception:
-                pass
-        itv = self.drain_cfg.get('snapshot_interval_minutes')
-        if itv is not None:
-            try:
-                cfg.snapshot_interval_minutes = int(itv)
-            except Exception:
-                pass
-        comp = self.drain_cfg.get('compress_state')
-        if comp is not None:
-            cfg.compress_state = bool(comp)
-
-        state_path = os.path.join(self.paths['output_dir'], self.paths['drain_state_file'])
+        state_path = os.path.join(
+            self.paths["output_dir"], self.paths["drain_state_file"]
+        )
         os.makedirs(os.path.dirname(state_path), exist_ok=True)
 
-        tm = TemplateMiner(persistence_handler=FilePersistence(state_path), config=cfg)
+        self. persistence_path = state_path
 
-        # Attempt to load previous state (safe on first run)
+        persistence = FilePersistence(self. persistence_path)
+        tm = TemplateMiner(persistence_handler=persistence, config=cfg)
+
         try:
             tm.load_state()
+            logging.info(f"Loaded {len(tm.drain.clusters)} templates from prior state.")
         except Exception as e:
-            LOGGER.info("No prior state to load: %s", e)
+            logging.info(f"No prior Drain3 state to load: {e}")
         return tm
 
-    @property
-    def tm(self):
-        if self._tm is None:
-            self._tm = self._make_template_miner()
-        return self._tm
-
     def save_state(self, reason: str = "manual") -> None:
+        """Saves the current state of the template miner."""
         try:
-            self.tm.save_state(snapshot_reason=reason)
+            self._tm.save_state(snapshot_reason=reason)
         except Exception as e:
-            LOGGER.warning("Failed to save drain3 state: %s", e)
+            logging.warning(f"Failed to save drain3 state: {e}")
 
     def train_from_df(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Feed messages to Drain3 and return a DataFrame of cluster assignments."""
+        """
+        Feeds messages to Drain3 and returns a DataFrame of training results.
 
-        results: List[Dict] = []
-        with throttled_snapshots(self.tm, min_interval_sec=300):  # at most one save every 5 minutes
-            for idx, row in tqdm(df.iterrows(), total=len(df), desc="Drain3 training"):
-                msg = str(row['message']) if 'message' in row else str(row.get('raw', ''))
+        Args:
+            df: The DataFrame containing parsed log data.
+
+        Returns:
+            A DataFrame with details for each processed log message, including
+            the assigned cluster and corrected template.
+        """
+        results: List[Dict[str, Any]] = []
+        user_strings = self.correction_cfg.get("user_strings")
+        message_col = self.config.get("pipeline_options", {}).get("message_column", "message")
+
+        interval = self.drain_cfg.get("throttled_snapshot_interval_sec", 300)
+        with throttled_snapshots(self._tm, min_interval_sec=interval):
+            for _, row in tqdm(df.iterrows(), total=len(df), desc="Drain3 training"):
+                msg = str(row.get(message_col) or row.get("raw", ""))
                 if not msg:
                     continue
                 try:
-                    r = self.tm.add_log_message(msg)  # training: create/update clusters
+                    result = self._tm.add_log_message(msg)
+                    cluster_id = result["cluster_id"]
+                    template = result["template_mined"]
+                    corrected_template = template # correct_oracle_template(template, user_strings)
+                    results.append(
+                        {
+                            "cluster_id": cluster_id,
+                            "template": template,
+                            "corrected_template": corrected_template,
+                            "was_corrected": template != corrected_template,
+                            "component": row.get("component"),
+                            "log_level": row.get("level"),
+                        }
+                    )
                 except Exception as e:
-                    LOGGER.warning("Drain3 error on row %s: %s", idx, e)
+                    logging.warning(f"Drain3 error on log '{msg[:100]}...': {e}")
                     continue
-                # r is a dict including 'cluster_id', 'template_mined', 'template_id' (depends on version)
-                # We normalize
-                cluster_id = r.get('cluster_id') or r.get('cluster_id_matched') or r.get('cluster').cluster_id if r.get(
-                    'cluster') else None
-                size = getattr(r.get('cluster'), "size", None)
-                template = r.get('template_mined') or (r.get('cluster').get_template() if r.get('cluster') else None)
-                corrected_template = correct_oracle_template(template)
-                was_corrected = template != corrected_template
+        return pd.DataFrame(results)
 
-                results.append({
-                    'cluster_id': cluster_id,
-                    'size': size,
-                    'template': template,
-                    'corrected_template': corrected_template,
-                    'was_corrected': was_corrected,
-                    "component": row.get('component', ''),
-                    "log_level": row.get('level', '')
-                })
+    def predict(self, df: pd.DataFrame, message_column: str = "message", log_file_column: str = "log_file") -> pd.DataFrame:
+        """
+        Matches log messages against a pre-trained Drain3 model to get templates.
 
-            return pd.DataFrame(results)
+        Args:
+            df: The DataFrame containing new log messages.
+            message_column: The name of the column with log messages.
+
+        Returns:
+            The input DataFrame with an added 'template' column.
+        """
+        if not os.path.exists(self.persistence_path):
+            raise FileNotFoundError(
+                f"Drain state file not found at {self.persistence_path}. "
+                "Please train the model first."
+            )
+
+        logging.info(
+            f"Loading drain state for prediction from {self.persistence_path}"
+        )
+        self._tm.load_state()
+
+        templates: List[Optional[str]] = []
+        df_new_log_messages = pd.DataFrame(columns=['log_file', 'new_log_message'])
+        logging.info("Matching logs to existing templates...")
+
+        delimiter = "___"
+        index = 0
+        for msg in tqdm((df[log_file_column].astype(str) + delimiter + df[message_column].astype(str)).tolist(), desc="Matching templates"):
+            msg_parts = msg.split(delimiter, 2)
+            log_file = msg_parts[0]
+            raw_msg = msg_parts[1]
+
+            # --- CRITICAL FIX STARTS HERE ---
+            result = self._tm.match(raw_msg)
+            if result:
+                # A template was successfully matched
+                templates.append(result.get_template())
+            else:
+                df_new_log_messages.loc[index, 'log_file'] = log_file
+                df_new_log_messages.loc[index, 'new_log_message'] = raw_msg
+
+                templates.append(raw_msg)
+            # --- CRITICAL FIX ENDS HERE ---
+            index += 1
+
+        if not df_new_log_messages.empty:
+            output_file_path = os.path.join(self.paths["output_dir"], self.paths["detection_new_log_messages_file"])
+            df_new_log_messages.to_csv(output_file_path, index=False)
+            logging.info(f"Saved new log message events in file={output_file_path}")
+            logging.info(f"Num of new log message events = {len(df)}")
+
+        df_with_templates = df.copy()
+        df_with_templates["template"] = templates
+        return df_with_templates
 
     def export_current_mined_templates(self) -> pd.DataFrame:
         """
-        Export current templates from Drain3 as a DataFrame with columns:
-        ['cluster_id', 'template', 'size'].
-        Compatible with different Drain3 layouts.
+        Exports current templates from Drain3 as a DataFrame.
+
+        Returns:
+            A DataFrame with columns: ['cluster_id', 'template', 'corrected_template',
+            'was_corrected', 'size'].
         """
+        clusters = self._tm.drain.clusters
+        user_strings = self.correction_cfg.get("user_strings")
         rows = []
-
-        # Find the clusters mapping across common Drain3 layouts
-        clusters_map = None
-
-        # 1) Newer TemplateMiner may have .clusters
-        clusters_map = getattr(self.tm, "clusters", None)
-
-        # 2) Or it's hanging off .drain.clusters
-        if not clusters_map:
-            drain = getattr(self.tm, "drain", None)
-            clusters_map = getattr(drain, "clusters", None) if drain is not None else None
-
-        if not clusters_map:
-            # Return an empty frame with the expected columns instead of a generic empty df
-            return pd.DataFrame(columns=["cluster_id", "template", "size"])
-
-        for cid, cluster in clusters_map.mapping.items():
-            try:
-                # Prefer the method; fall back to attribute if needed
-                if hasattr(cluster, "get_template"):
-                    template = cluster.get_template()
-                else:
-                    template = getattr(cluster, "template", None)
-
-                size = getattr(cluster, "size", None)
-                # Some Drain3 variants store the id on the cluster itself
-                cluster_id = getattr(cluster, "cluster_id", cid)
-                corrected_template = correct_oracle_template(template)
-                was_corrected = template != corrected_template
-
-                rows.append(
-                    {"cluster_id": cluster_id, "template": template, "corrected_template": corrected_template,
-                     "was_corrected": was_corrected, "size": size}
-                )
-            except Exception as e:
-                # Be tolerant to odd cluster objects
-                logging.warning("Skipping a cluster due to error: %s", e)
-
-        # Build a DataFrame with stable, named columns
-        return pd.DataFrame.from_records(rows, columns=["cluster_id", "template", "corrected_template", "was_corrected", "size"])
+        for cluster in clusters:
+            template = cluster.get_template()
+            corrected_template = template # correct_oracle_template(template, user_strings)
+            rows.append(
+                {
+                    "cluster_id": cluster.cluster_id,
+                    "template": template,
+                    "corrected_template": corrected_template,
+                    "was_corrected": template != corrected_template,
+                    "size": cluster.size,
+                }
+            )
+        return pd.DataFrame(
+            rows,
+            columns=[
+                "cluster_id",
+                "template",
+                "corrected_template",
+                "was_corrected",
+                "size",
+            ],
+        )
 
 
 @contextmanager
-def throttled_snapshots(tm: TemplateMiner, min_interval_sec: int = 300):
+def throttled_snapshots(
+        tm: TemplateMiner, min_interval_sec: int = 300
+) -> Generator[None, None, None]:
     """
-    Temporarily replace tm.save_state with a throttled version.
-    Ensures one final save on exit.
-    """
-    real_save = tm.save_state
-    last = {"t": 0.0}
+    A context manager to temporarily replace tm.save_state with a throttled version,
+    ensuring one final save on exit.
 
-    def _throttled_save(*args, **kwargs):
+    Args:
+        tm: The TemplateMiner instance.
+        min_interval_sec: The minimum time in seconds between automatic snapshots.
+    """
+    real_save_state = tm.save_state
+    last_snapshot_time = {"t": 0.0}
+
+    def _throttled_save(*args: Any, **kwargs: Any) -> None:
         now = time.time()
-        if now - last["t"] >= min_interval_sec:
-            real_save(*args, **kwargs)
-            last["t"] = now
-        # else: skip snapshot
+        if now - last_snapshot_time["t"] >= min_interval_sec:
+            real_save_state(*args, **kwargs)
+            last_snapshot_time["t"] = now
 
     tm.save_state = _throttled_save
     try:
         yield
     finally:
-        tm.save_state = real_save
-        # always persist once at the end
+        tm.save_state = real_save_state
+        logging.info("Persisting final Drain3 state...")
         tm.save_state(snapshot_reason="end_of_training")
 
 
 def main(config_path: str) -> None:
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
-    config = load_config(config_path)
+    logging.info(f"Loading configuration from {config_path}")
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
 
-    # 1) Parse logs
-    LOGGER.info("Parsing logs -> DataFrame...")
-    log_df = parse_logs_to_df(config)
+    # 1. Load previously parsed logs
+    # This step assumes a prior script (like parser.py) has run and produced this file.
+    from src.log_parser.parser import RawLogParser
 
-    logging.info("Log DataFrame columns: %s", list(log_df.columns))
-    logging.info("Log head:\n%s", log_df.head(5).to_string())
-    logging.info("Num Log: %d", len(log_df))
+    parser = RawLogParser(config)
+    log_df = parser.load_logs_df_from_csv()
 
-    out_dir = config['paths']['output_dir']
-    os.makedirs(out_dir, exist_ok=True)
-
-    # 2) Train Drain3
+    # 2. Train Drain3
     pipeline = Drain3Pipeline(config)
     try:
-        trained_logs_template_df = pipeline.train_from_df(log_df)
+        pipeline.train_from_df(log_df)
 
-        # 3) Export templates
-        tmpl_df = pipeline.export_current_mined_templates()
+        # 3. Export templates
+        templates_df = pipeline.export_current_mined_templates()
+        logging.info(f"Extracted {len(templates_df)} unique templates.")
 
-        logging.info("Templates DataFrame columns: %s", list(tmpl_df.columns))
-        logging.info("Templates head:\n%s", tmpl_df.head(5).to_string())
-        logging.info("Num templates: %d", len(tmpl_df))
+        logging.info("Unique Drain3 mined templates columns: %s", list(templates_df.columns))
+        logging.info("Num templates: %d", len(templates_df))
 
-        # 4) Persist
-        corrected_jsonl = os.path.join(out_dir, config['paths']['corrected_templates_jsonl'])
-        tmpl_df.to_json(corrected_jsonl, orient='records', lines=True)
+        # 4. Persist results
+        paths = config["paths"]
+        output_path = os.path.join(
+            paths["output_dir"], paths["corrected_templates_file"]
+        )
+        templates_df.to_json(output_path, orient="records", lines=True)
+        logging.info(f"Exported templates (with corrections) to {output_path}")
 
-        LOGGER.info("Exported %d templates (corrected) to %s", len(tmpl_df), corrected_jsonl)
     finally:
         pipeline.save_state(reason="end_of_run")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     import argparse
 
     ap = argparse.ArgumentParser()

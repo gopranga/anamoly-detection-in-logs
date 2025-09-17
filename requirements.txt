@@ -1,0 +1,21 @@
+# requirements.txt
+
+# Core ML & Data Handling
+pandas
+scikit-learn
+torch
+sentence-transformers
+joblib
+
+# Log Parsing
+drain3
+
+# Utilities
+pyyaml
+python-dateutil
+tqdm
+pytz
+matplotlib
+
+# Visualize
+seaborn

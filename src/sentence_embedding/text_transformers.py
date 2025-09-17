@@ -1,97 +1,142 @@
+# src/sentence_embedding/text_transformers.py
+"""
+Handles the conversion of text (log templates) into numerical vector embeddings.
+This module can be run directly to test the embedding functionality, including
+saving the generated embeddings to a file.
+"""
+
 import logging
 import os
-from typing import Dict, List
+from typing import Any, Dict, List
 
 import numpy as np
 import pandas as pd
 import yaml
+from sentence_transformers import SentenceTransformer
+from sklearn.preprocessing import normalize
 
-LOGGER = logging.getLogger(__name__)
-
-
-def _embed_sentence_transformers(texts: List[str]) -> np.ndarray:
-    from sentence_transformers import SentenceTransformer
-    model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
-    return model.encode(texts, batch_size=64, convert_to_numpy=True, normalize_embeddings=True)
-
-
-def _embed_tfidf_svd(texts: List[str], dims: int = 64) -> np.ndarray:
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.decomposition import TruncatedSVD
-    tfidf = TfidfVectorizer(ngram_range=(1, 2), min_df=1)
-    X = tfidf.fit_transform(texts)
-    k = min(dims, max(2, X.shape[1] - 1))
-    svd = TruncatedSVD(n_components=k, random_state=0)
-    V = svd.fit_transform(X)
-    # L2 normalize
-    V = V / (np.linalg.norm(V, axis=1, keepdims=True) + 1e-12)
-    return V
+# Configure logging for standalone execution and module usage.
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s"
+)
 
 
-def _embed_hash(texts: List[str], dims: int = 64) -> np.ndarray:
-    import re as _re
-    M = len(texts)
-    mat = np.zeros((M, dims), dtype=float)
-    for i, t in enumerate(texts):
-        for tok in _re.findall(r"\w+|<\*>|[^\w\s]", t.lower()):
-            mat[i, hash(tok) % dims] += 1.0
-    mat /= (np.linalg.norm(mat, axis=1, keepdims=True) + 1e-12)
-    return mat
+class SentenceTransformerPipeline:
+    """
+    A pipeline for generating embeddings using a SentenceTransformer model.
+    The model is loaded once upon initialization for efficiency.
+    """
 
+    def __init__(self, config: Dict[str, Any]):
+        """
+        Initializes the pipeline and loads the pre-trained model from config.
 
-def load_config(path: str) -> Dict:
-    with open(path, 'r', encoding='utf-8') as fh:
-        return yaml.safe_load(fh)
+        Args:
+            config: A dictionary containing the 'embedding_config'.
+        """
+        embedding_cfg = config.get("embedding_config", {})
+        model_name = embedding_cfg.get("model_name", "all-MiniLM-L6-v2")
 
-
-def main(config_path: str = 'src/configs/project.yaml') -> None:
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
-    cfg = load_config(config_path)
-    out_dir = cfg['paths']['output_dir']
-    corrected_jsonl = os.path.join(out_dir, cfg['paths']['corrected_templates_jsonl'])
-    emb_out_jsonl = os.path.join(out_dir, cfg['paths']['embeddings_jsonl'])
-    emb_out_npy = os.path.join(out_dir, 'regex_embeddings.npy')  # Path for NumPy file export
-    os.makedirs(out_dir, exist_ok=True)
-
-    if not os.path.exists(corrected_jsonl):
-        LOGGER.error("Corrected templates JSONL not found at %s. Run the Drain3 pipeline first.", corrected_jsonl)
-        return
-
-    df = pd.read_json(corrected_jsonl, orient='records', lines=True)
-    texts = df['corrected_template'].astype(str).tolist()
-    if not texts:
-        LOGGER.warning("No templates to embed.")
-        return
-
-    try:
-        V = _embed_sentence_transformers(texts)
-        method = 'sentence-transformers/all-MiniLM-L6-v2'
-    except Exception as e1:
-        LOGGER.info("sentence-transformers unavailable (%s). Falling back to TF-IDF+SVD.", e1)
+        logging.info(f"Loading SentenceTransformer model: {model_name}...")
         try:
-            V = _embed_tfidf_svd(texts)
-            method = 'tfidf+svd'
-        except Exception as e2:
-            LOGGER.info("TF-IDF+SVD failed (%s). Falling back to simple hashing.", e2)
-            V = _embed_hash(texts)
-            method = 'simple-hash'
+            self.model = SentenceTransformer(model_name)
+            logging.info("SentenceTransformer model loaded successfully.")
+        except Exception as e:
+            logging.error(
+                f"Failed to load SentenceTransformer model '{model_name}'. Error: {e}"
+            )
+            raise
 
-    # Normalize the embeddings for safety
-    V = V / (np.linalg.norm(V, axis=1, keepdims=True) + 1e-12)
+    def embed_sentences(
+            self, sentences: List[str], normalize_embeddings: bool = True
+    ) -> np.ndarray:
+        """
+        Generates embeddings for a list of sentences.
 
-    # Export the embeddings as JSONL
-    emb_df = pd.DataFrame(V, columns=[f'e{i}' for i in range(V.shape[1])])
-    out_df = pd.concat([df[['cluster_id', 'corrected_template']].reset_index(drop=True), emb_df], axis=1)
-    out_df.to_json(emb_out_jsonl, orient='records', lines=True)
+        Args:
+            sentences: A list of strings to be embedded.
+            normalize_embeddings: If True, L2-normalizes the embeddings.
 
-    # Export the embeddings as a NumPy file
-    np.save(emb_out_npy, V)
+        Returns:
+            A numpy array of the generated embeddings.
+        """
+        if not sentences:
+            return np.array([])
 
-    LOGGER.info("Saved %d embeddings to %s (JSONL) and %s (NumPy) using %s",
-                len(out_df), emb_out_jsonl, emb_out_npy, method)
+        logging.info(f"Generating embeddings for {len(sentences)} sentences...")
+        embeddings = self.model.encode(sentences, show_progress_bar=True)
+
+        if normalize_embeddings:
+            logging.info("Normalizing embeddings to unit length.")
+            embeddings = normalize(embeddings, norm="l2", axis=1)
+
+        return embeddings
 
 
-if __name__ == '__main__':
+def main(config_path: str) -> None:
+    logging.info("--- Running Sentence Transformer Pipeline Test ---")
+
+    # 1. Load configuration from the YAML file
+    try:
+        with open(config_path, "r") as f:
+            config = yaml.safe_load(f)
+    except FileNotFoundError:
+        logging.error(f"Configuration file not found at: {config_path}")
+        return
+
+    # 2. Initialize the pipeline
+    try:
+        pipeline = SentenceTransformerPipeline(config=config)
+    except Exception as e:
+        logging.error(
+            "Failed to initialize pipeline. "
+            "Ensure you have run 'pip install -r requirements.txt'. Error: %s",
+            e,
+        )
+        return
+
+    # 3. Log templates for embedding
+    paths = config["paths"]
+
+    corrected_templates_file_path = os.path.join(
+        paths["output_dir"], paths["corrected_templates_file"]
+    )
+    df = pd.read_json(corrected_templates_file_path, orient='records', lines=True)
+    sample_templates = df['corrected_template'].astype(str).tolist()
+    logging.info("Embedding %d sample templates...", len(sample_templates))
+
+    # 4. Generate embeddings
+    embeddings = pipeline.embed_sentences(sample_templates)
+
+    # 5. Save the embeddings to the output file specified in the config
+    if embeddings.size > 0:
+        output_file = os.path.join(
+            paths["output_dir"], paths["output_embeddings_file"]
+        )
+
+        if not output_file:
+            logging.error("'output_embeddings_file' not defined in config paths.")
+            return
+
+        # Ensure the output directory exists
+        output_dir = os.path.dirname(output_file)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+
+        try:
+            np.save(output_file, embeddings)
+            logging.info(f"Embeddings successfully saved to: {output_file}")
+        except Exception as e:
+            logging.error(f"Failed to save embeddings to {output_file}. Error: {e}")
+
+        logging.info("\n--- Test Results ---")
+        logging.info("Shape of embeddings matrix: %s", embeddings.shape)
+        logging.info("First 5 dimensions of the first vector: %s", embeddings[0, :5])
+    else:
+        logging.warning("Failed to generate embeddings. Nothing to save.")
+
+
+if __name__ == "__main__":
     import argparse
 
     ap = argparse.ArgumentParser()
